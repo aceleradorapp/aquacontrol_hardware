@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Credenciais reais (Wi-Fi, etc.) — nunca commitar. Copie de Segredos.h.exemplo
+include/Segredos.h
