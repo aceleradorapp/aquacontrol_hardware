@@ -1,0 +1,9 @@
+#ifndef SEGREDOS_H
+#define SEGREDOS_H
+
+// Copie este arquivo para "Segredos.h" (sem ".exemplo") e preencha com suas credenciais
+// reais. O Segredos.h de verdade está no .gitignore e nunca é commitado.
+const char* const WIFI_SSID  = "NOME_DA_SUA_REDE";
+const char* const WIFI_SENHA = "SENHA_DA_SUA_REDE";
+
+#endif
