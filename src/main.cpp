@@ -14,7 +14,7 @@
 // neste projeto, entao isso e incrementado manualmente a cada mudanca relevante. A data/
 // hora de compilacao (__DATE__/__TIME__) e automatica e sempre confiavel, essa nao precisa
 // de manutencao manual.
-#define FIRMWARE_VERSAO "1.1.0"
+#define FIRMWARE_VERSAO "1.2.0"
 
 // Arquivo de credenciais (Certifique-se de que ele existe na pasta include)
 #include "Segredos.h"
@@ -49,6 +49,29 @@ const uint8_t PINOS_RELES[TOTAL_RELES] = {
 };
 // GPIO 02 e GPIO 15 ficam reservados (não usados aqui) para expansões futuras (LED de
 // status, fita WS2812B etc.) — ver a especificação de fiação.
+
+// --- Sequenciador de Animações (35-espc, Tema Tempestade) ---
+// Toca uma sequência de passos recebida de uma vez só (POST /api/reles/sequencia) LOCALMENTE,
+// sem depender de rede durante a animação — ver 01-espc-geral/35_especificacao_tema_tempestade_e_efeitos_reles.md.
+// Cada passo tem 16 posições com TRÊS valores possíveis (não só liga/desliga): 1=liga,
+// 0=desliga, -1=NÃO MEXE — precisa desse terceiro valor pra nunca atropelar um relé de
+// equipamento real (filtro, aquecedor) que não faz parte da animação. Roda de forma NÃO
+// bloqueante a partir do loop() principal (millis(), nunca delay() longo) — este firmware não
+// tem nenhuma task/watchdog customizado (só o padrão do Arduino-ESP32), então um delay() de
+// vários segundos travaria server.handleClient() inteiro e arrisca reset por watchdog.
+const uint8_t MAX_PASSOS_SEQUENCIA = 48;
+const uint16_t DELAY_MS_MINIMO_SEGURANCA = 40; // piso de proteção mecânica dos relés (35-espc, 2.3)
+
+struct PassoSequencia {
+    int8_t reles[TOTAL_RELES]; // -1 = nao mexe, 0 = desliga, 1 = liga
+    uint16_t delayMs;
+};
+
+PassoSequencia sequenciaPassos[MAX_PASSOS_SEQUENCIA];
+uint8_t sequenciaTotalPassos = 0;
+uint8_t sequenciaPassoAtual = 0;
+bool sequenciaAtiva = false;
+unsigned long sequenciaProximoPassoEm = 0;
 
 // IP do backend (AquaControl_Brain) recebido no handshake (POST /api/config) e persistido
 // em NVS — sobrevive a reinicializações, não precisa handshake de novo todo boot.
@@ -268,6 +291,94 @@ const char* descreverMotivoReset(esp_reset_reason_t motivo) {
     }
 }
 
+// Aplica UM passo da sequência nos GPIOs de verdade (mesma conversão Active-LOW de
+// handlePostReles) — pula qualquer posição marcada -1 ("não mexe").
+void aplicarPassoSequencia(uint8_t indicePasso) {
+    for (uint8_t i = 0; i < TOTAL_RELES; i++) {
+        int8_t valor = sequenciaPassos[indicePasso].reles[i];
+        if (valor < 0) continue; // -1 = nao mexe nesta porta
+        digitalWrite(PINOS_RELES[i], valor == 1 ? LOW : HIGH);
+    }
+}
+
+// Chamada a cada loop() — só age quando já passou tempo suficiente desde o último passo
+// (millis(), NÃO bloqueante). Aplica o passo atual, agenda o próximo e avança o índice; ao
+// terminar todos os passos, simplesmente para (o último passo aplicado fica valendo — os
+// padrões gerados no Brain sempre terminam com as lâmpadas apagadas, ver geradorTempestade.js).
+void processarSequenciaEmAndamento() {
+    if (!sequenciaAtiva) return;
+    if (millis() < sequenciaProximoPassoEm) return;
+
+    aplicarPassoSequencia(sequenciaPassoAtual);
+    uint16_t espera = sequenciaPassos[sequenciaPassoAtual].delayMs;
+    if (espera < DELAY_MS_MINIMO_SEGURANCA) espera = DELAY_MS_MINIMO_SEGURANCA; // defesa em profundidade
+    sequenciaProximoPassoEm = millis() + espera;
+    sequenciaPassoAtual++;
+
+    if (sequenciaPassoAtual >= sequenciaTotalPassos) {
+        sequenciaAtiva = false;
+        Serial.println("[SEQUENCIA] Concluida.");
+    }
+}
+
+// POST /api/reles/sequencia — recebe { "passos": [{ "reles":[16 x -1/0/1], "delayMs": N }, ...] }
+// e guarda tudo pra tocar localmente (ver processarSequenciaEmAndamento, chamada a cada
+// loop()). Responde IMEDIATAMENTE, antes de tocar qualquer coisa — a execução de verdade
+// acontece nos próximos ciclos do loop(), sem segurar esta requisição HTTP.
+void handlePostSequencia() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"status\":\"erro: sem corpo de dados\"}");
+        return;
+    }
+
+    JsonDocument doc;
+    DeserializationError erro = deserializeJson(doc, server.arg("plain"));
+    if (erro || !doc["passos"].is<JsonArray>()) {
+        server.send(400, "application/json", "{\"status\":\"erro: json invalido, esperado array \\\"passos\\\"\"}");
+        return;
+    }
+
+    uint8_t total = 0;
+    for (JsonVariant passoJson : doc["passos"].as<JsonArray>()) {
+        if (total >= MAX_PASSOS_SEQUENCIA) break;
+
+        uint8_t i = 0;
+        if (passoJson["reles"].is<JsonArray>()) {
+            for (JsonVariant v : passoJson["reles"].as<JsonArray>()) {
+                if (i >= TOTAL_RELES) break;
+                sequenciaPassos[total].reles[i] = (int8_t)v.as<int>();
+                i++;
+            }
+        }
+        for (; i < TOTAL_RELES; i++) sequenciaPassos[total].reles[i] = -1; // sobra sem valor = nao mexe
+
+        uint16_t delayPedido = passoJson["delayMs"].as<uint16_t>();
+        sequenciaPassos[total].delayMs = delayPedido < DELAY_MS_MINIMO_SEGURANCA ? DELAY_MS_MINIMO_SEGURANCA : delayPedido;
+        total++;
+    }
+
+    if (total == 0) {
+        server.send(400, "application/json", "{\"status\":\"erro: sequencia vazia\"}");
+        return;
+    }
+
+    sequenciaTotalPassos = total;
+    sequenciaPassoAtual = 0;
+    sequenciaAtiva = true;
+    sequenciaProximoPassoEm = millis(); // primeiro passo aplica ja no proximo loop()
+
+    Serial.printf("[SEQUENCIA] %d passo(s) recebido(s), iniciando.\n", total);
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+// POST /api/reles/sequencia/parar — cancela uma animacao em andamento sem mexer em pino
+// nenhum (o Brain decide o estado final com um POST /api/reles normal, se precisar).
+void handlePostPararSequencia() {
+    sequenciaAtiva = false;
+    Serial.println("[SEQUENCIA] Parada via /api/reles/sequencia/parar.");
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
 // GET /api/reles — lê o estado atual das 16 saídas direto nos GPIOs, convertendo a lógica
 // física Active LOW (LOW = ligado) para o array lógico 1=ligado/0=desligado que o resto do
 // sistema (Brain, Display) entende. digitalRead() num pino já configurado OUTPUT no ESP32
@@ -301,6 +412,8 @@ void handlePostReles() {
         server.send(400, "application/json", "{\"status\":\"erro: json invalido, esperado array \\\"reles\\\"\"}");
         return;
     }
+
+    sequenciaAtiva = false; // 35-espc: qualquer comando de rele "normal" cancela uma animacao em andamento
 
     digitalWrite(pinoLed, LOW); // pisca (LED fica fixo aceso enquanto conectado — ver conectarWifi())
 
@@ -337,6 +450,7 @@ void handleGetStatus() {
     doc["uptime_s"] = millis() / 1000;
     doc["ip_backend_salvo"] = ipBackend;
     doc["controle_reles"] = "gpio_direto"; // 11-espc: sem MCP23017/I2C, GPIOs nativos do ESP32
+    doc["sequencia_ativa"] = sequenciaAtiva; // 35-espc: diagnostico do sequenciador de animacoes
 
     // --- Chip / CPU ---
     doc["chip_modelo"] = ESP.getChipModel();
@@ -394,6 +508,8 @@ void setup() {
     server.on("/api/status", HTTP_GET, handleGetStatus);
     server.on("/api/reles", HTTP_GET, handleGetReles);
     server.on("/api/reles", HTTP_POST, handlePostReles);
+    server.on("/api/reles/sequencia", HTTP_POST, handlePostSequencia); // 35-espc
+    server.on("/api/reles/sequencia/parar", HTTP_POST, handlePostPararSequencia); // 35-espc
     server.begin();
     Serial.println("WebServer do Modulo de Reles ativo na porta 80.");
 }
@@ -407,4 +523,5 @@ void loop() {
     }
 
     server.handleClient();
+    processarSequenciaEmAndamento(); // 35-espc: nao bloqueante, so age quando ja passou o tempo do proximo passo
 }
